@@ -13,7 +13,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     
     jar = aiohttp.CookieJar(unsafe=True)
-    session = aiohttp.ClientSession(cookiejar=jar)
+    session = aiohttp.ClientSession(cookie_jar=jar)
     
     client = MinolOnlineClient(entry.data[CONF_USERNAME], entry.data[CONF_PASSWORD], session)
     coordinator = MinolDataCoordinator(hass, client, session)
