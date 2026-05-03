@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Minol Direct Login",
+        "description": "Please enter your Credentials",
+        "data": {
+          "username": "E-Mail",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "auth": "wrong Mail or Password",
+      "cannot_connect": "Can not Connect",
+      "no_tenants": "Login Success, no Tenants found"
+    },
+    "abort": {
+      "already_configured": "This Account already exists."
+    }
+  }
+}
