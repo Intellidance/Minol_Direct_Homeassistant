@@ -1,4 +1,4 @@
-# minol-direct-to-home-assistant
+# Minol Direct HACS
 
 > [!WARNING]
 > We are aware that there are issues in the codebase.
