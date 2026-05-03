@@ -22,7 +22,8 @@ class MinolOnlineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
 
             jar = aiohttp.CookieJar(unsafe=True)
-            async with aiohttp.ClientSession(cookiejar=jar) as session:
+
+            async with aiohttp.ClientSession(cookie_jar=jar) as session:
                 client = MinolOnlineClient(username, password, session)
                 try:
                     # Login durchführen und Wohnungen abrufen
