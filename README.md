@@ -1,4 +1,5 @@
 # Minol Direct HACS Integration for HomeAssistant
+   ![Minol Logo](assets/Minol_Direct.svg)
 
 > [!WARNING]
 > We are aware that there are issues in the codebase.
