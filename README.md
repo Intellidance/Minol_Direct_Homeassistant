@@ -43,7 +43,7 @@
 2. Go to **Integrations**.
 3. Click menu (three dots) -> **Custom repositories**.
 4. Add repository URL:
-   - `https://github.com/YOUR_GITHUB_NAME/minol-brunata-home-assistant`
+   - `https://github.com/Intellidance/Minol_Direct_Homeassistant`
 5. Select category: **Integration**.
 6. Install **Minol_Direct_Homeassistant**.
 7. Restart Home Assistant.
