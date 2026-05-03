@@ -1,4 +1,4 @@
-# Minol Direct HACS
+# Minol Direct HACS Integration for HomeAssistant
 
 > [!WARNING]
 > We are aware that there are issues in the codebase.
