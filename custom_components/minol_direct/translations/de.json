@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Minol Direct Login",
+        "description": "Bitte gib deine Zugangsdaten für das Minol Portal ein.",
+        "data": {
+          "username": "E-Mail Adresse",
+          "password": "Passwort"
+        }
+      }
+    },
+    "error": {
+      "auth": "E-Mail oder Passwort falsch.",
+      "cannot_connect": "Verbindung zu Minol fehlgeschlagen. Siehe Logs.",
+      "no_tenants": "Login erfolgreich, aber keine Wohnungen (Tenants) gefunden."
+    },
+    "abort": {
+      "already_configured": "Dieses Konto ist bereits eingerichtet."
+    }
+  }
+}
