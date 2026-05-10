@@ -18,9 +18,11 @@ APP_LOGIN_URL = f"{SAP_HOST}/minol.com~kundenportal~login~saml/?logonTargetUrl=h
 TENANTS_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/getUserTenants"
 READ_DATA_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/readData"
 
+# Wir nutzen exakt den PowerShell User-Agent, da die Azure WAF diesen anstandslos durchlässt.
+PS_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.19045; de-DE) PowerShell/7.4.2"
+
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "User-Agent": PS_USER_AGENT
 }
 
 
@@ -136,7 +138,7 @@ class MinolOnlineClient:
             await self._authenticate()
 
         headers = {
-            "User-Agent": BROWSER_HEADERS["User-Agent"],
+            "User-Agent": PS_USER_AGENT,
             "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json, text/javascript, */*; q=0.01",
         }
@@ -189,7 +191,7 @@ class MinolOnlineClient:
         start_date = f"{now.year - 1}01"
         end_date = now.strftime("%Y%m")
         headers = {
-            "User-Agent": BROWSER_HEADERS["User-Agent"],
+            "User-Agent": PS_USER_AGENT,
             "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Content-Type": "application/json; charset=UTF-8",
@@ -281,32 +283,33 @@ class MinolOnlineClient:
             _LOGGER.debug("[S2] CSRF: %s... | TX: %s...", csrf_token[:15], tx_token[:15])
 
             # === SCHRITT 2: Credentials an Azure B2C senden ===
-            auth_body_str = (
-                f"request_type=RESPONSE"
-                f"&signInName={urllib.parse.quote(self._username, safe='')}"
-                f"&password={urllib.parse.quote(self._password, safe='')}"
-            )
+            # Payload manuell in rohe Bytes wandeln, um automatische (und potentiell störende) aiohttp-Modifikationen zu umgehen
+            auth_payload = {
+                "request_type": "RESPONSE",
+                "signInName": self._username,
+                "password": self._password
+            }
+            auth_body_bytes = urllib.parse.urlencode(auth_payload).encode("utf-8")
+            
             _LOGGER.debug(
                 "[S2] POST SelfAsserted | signInName: %s | password: ***",
                 urllib.parse.quote(self._username, safe=''),
             )
 
-            # Die absolut kritischen Header für Azure B2C reduzieren (Schutz vor CSRF)
-            # WAF blockiert häufig bei Referer/Origin Mismatches -> Analog PS1 nur das Nötigste schicken
+            # Striktes Nachbauen der PowerShell-Header
             auth_headers = {
-                "User-Agent": BROWSER_HEADERS["User-Agent"],
+                "User-Agent": PS_USER_AGENT,
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                 "X-CSRF-TOKEN": csrf_token,
                 "X-Requested-With": "XMLHttpRequest"
             }
 
-            # URL manuell bauen und yarl-Encoding umgehen (encoded=True)!
-            # Das 'tx'-Token darf von yarl nicht nochmal URL-kodiert werden, sonst wirft B2C HTTP 400.
+            # URL manuell bauen und yarl-Encoding umgehen (encoded=True) - genau wie in PS
             auth_url_str = f"{SELF_ASSERTED_URL}?tx={tx_token}&p={B2C_POLICY}"
 
             async with self._session.post(
                 URL(auth_url_str, encoded=True),
-                data=auth_body_str,
+                data=auth_body_bytes,
                 headers=auth_headers,
                 allow_redirects=False,
             ) as resp2:
