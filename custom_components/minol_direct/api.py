@@ -1,4 +1,4 @@
-import logging, re, json, base64
+import logging, re, json, base64, urllib.parse
 from datetime import datetime
 from aiohttp import ClientSession
 from yarl import URL
@@ -235,20 +235,46 @@ class MinolOnlineClient:
             _LOGGER.debug("[S2] CSRF: %s... | TX: %s...", csrf_token[:15], tx_token[:15])
 
             # === SCHRITT 2: Credentials an Azure B2C senden ===
-            _LOGGER.debug("[S2] POST SelfAsserted...")
-            async with self._session.post(
-                SELF_ASSERTED_URL,
-                params={"tx": tx_token, "p": B2C_POLICY},
-                data={"request_type": "RESPONSE", "signInName": self._username, "password": self._password},
-                headers={"X-CSRF-TOKEN": csrf_token, "X-Requested-With": "XMLHttpRequest"},
-                allow_redirects=False,
-            ) as resp:
-                body = await resp.text()
-                _LOGGER.debug("[S2] HTTP %s", resp.status)
-                if '"status":"400"' in body:
-                    _LOGGER.error("[S2] Login abgelehnt: %s", body)
-                    raise MinolAuthError("Login abgelehnt (E-Mail oder Passwort falsch).")
-            self._dump_cookie_jar("NACH S2")
+import urllib.parse
+
+# === SCHRITT 2: Credentials an Azure B2C senden ===
+_LOGGER.debug("[S2] POST SelfAsserted...")
+
+# Exakt wie PowerShell: urllib.parse.quote() = [uri]::EscapeDataString()
+auth_body_str = (
+    f"request_type=RESPONSE"
+    f"&signInName={urllib.parse.quote(self._username, safe='')}"
+    f"&password={urllib.parse.quote(self._password, safe='')}"
+)
+_LOGGER.debug("[S2] Encoded Body (Passwort maskiert): request_type=RESPONSE&signInName=%s&password=***", urllib.parse.quote(self._username, safe=''))
+
+async with self._session.post(
+    SELF_ASSERTED_URL,
+    params={"tx": tx_token, "p": B2C_POLICY},
+    data=auth_body_str,
+    headers={
+        "User-Agent": BROWSER_HEADERS["User-Agent"],  # War vorher nicht gesetzt!
+        "X-CSRF-TOKEN": csrf_token,
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",  # Exakt wie PowerShell
+    },
+    allow_redirects=False,
+) as resp:
+    body = await resp.text()
+    _LOGGER.debug("[S2] HTTP %s | Response Body: %s", resp.status, body[:500])
+
+    # HTTP 400 = malformed request (CSRF, Format, User-Agent Problem)
+    if resp.status == 400:
+        _LOGGER.error("[S2] HTTP 400 von Azure B2C! Vollständiger Body:\n%s", body)
+        raise MinolAuthError(f"Azure B2C lehnt Authentifizierungsanfrage ab (HTTP 400): {body[:200]}")
+
+    # HTTP 200 mit JSON-Status 400 = falsche Credentials
+    if '"status":"400"' in body or '"status": "400"' in body:
+        _LOGGER.error("[S2] Zugangsdaten abgelehnt! Azure Antwort: %s", body)
+        raise MinolAuthError("Login abgelehnt (E-Mail oder Passwort falsch).")
+
+    _LOGGER.debug("[S2] Login von Azure akzeptiert.")
+
 
             # === SCHRITT 3: SAMLResponse vom Confirmed-Endpoint ===
             conf_url = f"{CONFIRMED_URL}?rememberMe=false&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
