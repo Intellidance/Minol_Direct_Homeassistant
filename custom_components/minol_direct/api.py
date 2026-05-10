@@ -291,21 +291,21 @@ class MinolOnlineClient:
                 urllib.parse.quote(self._username, safe=''),
             )
 
-            # Die absolut kritischen Header für Azure B2C (Schutz vor CSRF)
+            # Die absolut kritischen Header für Azure B2C reduzieren (Schutz vor CSRF)
+            # WAF blockiert häufig bei Referer/Origin Mismatches -> Analog PS1 nur das Nötigste schicken
             auth_headers = {
                 "User-Agent": BROWSER_HEADERS["User-Agent"],
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Origin": B2C_HOST,
-                "Referer": azure_final_url,
                 "X-CSRF-TOKEN": csrf_token,
                 "X-Requested-With": "XMLHttpRequest"
             }
 
+            # URL manuell bauen und yarl-Encoding umgehen (encoded=True)!
+            # Das 'tx'-Token darf von yarl nicht nochmal URL-kodiert werden, sonst wirft B2C HTTP 400.
+            auth_url_str = f"{SELF_ASSERTED_URL}?tx={tx_token}&p={B2C_POLICY}"
+
             async with self._session.post(
-                SELF_ASSERTED_URL,
-                params={"tx": tx_token, "p": B2C_POLICY},
+                URL(auth_url_str, encoded=True),
                 data=auth_body_str,
                 headers=auth_headers,
                 allow_redirects=False,
@@ -328,10 +328,11 @@ class MinolOnlineClient:
             self._dump_cookie_jar("NACH S2")
 
             # === SCHRITT 3: SAMLResponse vom Confirmed-Endpoint ===
-            conf_url = f"{CONFIRMED_URL}?rememberMe=false&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
-            _LOGGER.debug("[S3] GET Confirmed: %s", conf_url)
+            # WICHTIG: Auch hier csrf_token und tx_token zwingend vor nochmaligem Encoding schützen!
+            conf_url_str = f"{CONFIRMED_URL}?rememberMe=false&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
+            _LOGGER.debug("[S3] GET Confirmed: %s", conf_url_str)
             async with self._session.get(
-                conf_url,
+                URL(conf_url_str, encoded=True),
                 headers=BROWSER_HEADERS,
                 allow_redirects=True,
             ) as resp:
@@ -415,4 +416,3 @@ class MinolOnlineClient:
             _LOGGER.warning("[AUTH] MYSAPSSO2 Cookie fehlt nach Login!")
 
         self._is_authenticated = True
-
