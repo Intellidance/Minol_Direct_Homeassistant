@@ -36,37 +36,30 @@ class MinolOnlineClient:
         self._is_authenticated = False
 
     def _dump_cookie_jar(self, label: str) -> None:
-        """Gibt den KOMPLETTEN Inhalt des Cookie-Jars aus."""
         all_cookies = list(self._session.cookie_jar)
         if not all_cookies:
             _LOGGER.debug("[COOKIES %s] Cookie-Jar ist LEER", label)
             return
-        _LOGGER.debug("[COOKIES %s] Alle %d Cookies im Jar:", label, len(all_cookies))
+        _LOGGER.debug("[COOKIES %s] %d Cookies im Jar:", label, len(all_cookies))
         for cookie in all_cookies:
             _LOGGER.debug(
-                "  -> Name: %-20s | Domain: %-35s | Pfad: %s",
+                "  -> %-20s | Domain: %-35s | Pfad: %s",
                 cookie.key,
                 cookie.get("domain", "?"),
                 cookie.get("path", "/"),
             )
 
-    async def _request(self, method: str, url: str, label: str, **kwargs) -> tuple[int, dict, str]:
-        """
-        Führt einen HTTP-Request OHNE automatischen Redirect aus.
-        Gibt (status, headers, body) zurück.
-        """
-        kwargs["allow_redirects"] = False
-        _LOGGER.debug("[%s] %s %s", label, method.upper(), url)
+    async def _post_no_redirect(self, url: str, label: str, **kwargs) -> tuple[int, dict, str]:
+        """POST ohne automatischen Redirect - gibt (status, headers, body) zurück."""
+        _LOGGER.debug("[%s] POST %s", label, url)
         if "data" in kwargs:
             safe = {k: ("***" if k.lower() == "password" else v) for k, v in kwargs["data"].items()}
             _LOGGER.debug("[%s] Payload: %s", label, safe)
-        if "headers" in kwargs:
-            _LOGGER.debug("[%s] Extra-Header: %s", label, kwargs["headers"])
 
-        async with self._session.request(method, url, **kwargs) as resp:
+        async with self._session.post(url, allow_redirects=False, **kwargs) as resp:
             body = await resp.text()
-            set_cookies = resp.headers.getall("Set-Cookie", [])
             location = resp.headers.get("Location", "")
+            set_cookies = resp.headers.getall("Set-Cookie", [])
             _LOGGER.debug(
                 "[%s] → HTTP %s | Location: %s | Set-Cookie Count: %d",
                 label, resp.status, location or "–", len(set_cookies),
@@ -75,40 +68,41 @@ class MinolOnlineClient:
                 _LOGGER.debug("[%s] Set-Cookie: %s", label, sc)
             return resp.status, dict(resp.headers), body
 
-    async def _follow_redirects(self, start_url: str, method: str, label: str, **kwargs) -> str:
+    async def _follow_redirects_from_post(self, start_url: str, label: str, post_data: dict) -> str:
         """
-        Folgt einer Redirect-Kette manuell, Schritt für Schritt.
-        Protokolliert jeden Zwischenschritt inkl. Set-Cookie Header.
-        Gibt den finalen HTML-Body zurück.
+        Führt einen POST aus, folgt dann allen Redirects manuell
+        und gibt den finalen HTML-Body zurück.
         """
-        url = start_url
-        current_method = method
-        current_kwargs = kwargs
+        # Erster Request: POST
+        status, headers, body = await self._post_no_redirect(
+            start_url, f"{label} POST",
+            data=post_data,
+            headers=BROWSER_HEADERS,
+        )
+
+        url = headers.get("Location", "")
+        hop = 0
         max_hops = 10
 
-        for hop in range(max_hops):
-            status, headers, body = await self._request(current_method, url, f"{label} Hop{hop+1}", **current_kwargs)
+        while url and status in (301, 302, 303, 307, 308) and hop < max_hops:
+            hop += 1
+            # Relative URLs auflösen
+            if url.startswith("/"):
+                url = SAP_HOST + url
 
-            if status in (301, 302, 303, 307, 308):
-                location = headers.get("Location", "")
-                if not location:
-                    _LOGGER.warning("[%s] Redirect ohne Location-Header!", label)
-                    return body
-                # Relative URLs auflösen
-                if location.startswith("/"):
-                    location = SAP_HOST + location
-                _LOGGER.debug("[%s] Redirect %s → %s", label, status, location)
-                # 302/303 erzwingen GET (wie Browser es tun)
-                if status in (302, 303):
-                    current_method = "GET"
-                    current_kwargs = {"headers": BROWSER_HEADERS}
-                url = location
-                continue
-            else:
-                # Kein Redirect mehr → fertig
-                return body
+            _LOGGER.debug("[%s Hop%d] GET %s", label, hop, url)
+            async with self._session.get(url, headers=BROWSER_HEADERS, allow_redirects=False) as resp:
+                body = await resp.text()
+                status = resp.status
+                set_cookies = resp.headers.getall("Set-Cookie", [])
+                url = resp.headers.get("Location", "")
+                _LOGGER.debug(
+                    "[%s Hop%d] → HTTP %s | Next-Location: %s | Set-Cookie Count: %d",
+                    label, hop, status, url or "–", len(set_cookies),
+                )
+                for sc in set_cookies:
+                    _LOGGER.debug("[%s Hop%d] Set-Cookie: %s", label, hop, sc)
 
-        _LOGGER.warning("[%s] Maximale Redirect-Tiefe erreicht!", label)
         return body
 
     async def async_get_user_tenants(self) -> list[dict]:
@@ -121,9 +115,8 @@ class MinolOnlineClient:
             "Accept": "application/json, text/javascript, */*; q=0.01",
         }
         _LOGGER.debug("[TENANTS] GET %s", TENANTS_URL)
-        self._dump_cookie_jar("VOR TENANTS-CALL")
+        self._dump_cookie_jar("VOR TENANTS")
 
-        # Tenants-API nutzt allow_redirects=True (normaler GET-Call)
         async with self._session.get(TENANTS_URL, headers=headers) as resp:
             text = await resp.text()
             _LOGGER.debug("[TENANTS] HTTP %s | Content-Type: %s", resp.status, resp.headers.get("Content-Type", "?"))
@@ -132,7 +125,7 @@ class MinolOnlineClient:
                     return json.loads(text)
                 except json.JSONDecodeError:
                     _LOGGER.error("[TENANTS] Kein JSON empfangen!")
-                    _LOGGER.debug("[TENANTS] Erste 500 Zeichen der Antwort:\n%s", text[:500])
+                    _LOGGER.debug("[TENANTS] Erste 300 Zeichen:\n%s", text[:300])
             else:
                 _LOGGER.error("[TENANTS] HTTP Fehler: %s", resp.status)
         return []
@@ -197,10 +190,17 @@ class MinolOnlineClient:
         _LOGGER.debug("=== STARTE AUTHENTICATION FLOW ===")
         _LOGGER.debug("=" * 60)
 
-        # === SCHRITT 1: Azure B2C Login-Seite ===
-        status, headers, html = await self._request("GET", INIT_URL, "S1-INIT", headers=BROWSER_HEADERS)
+        # === SCHRITT 1: INIT_URL abrufen MIT automatischem Redirect ===
+        # SAP leitet via 302 nach Azure B2C weiter.
+        # allow_redirects=True folgt dieser Weiterleitung automatisch!
+        _LOGGER.debug("[S1-INIT] GET %s (allow_redirects=True)", INIT_URL)
+        async with self._session.get(INIT_URL, headers=BROWSER_HEADERS, allow_redirects=True) as resp:
+            html = await resp.text()
+            _LOGGER.debug("[S1-INIT] Final-URL: %s | HTTP %s", resp.url, resp.status)
+            _LOGGER.debug("[S1-INIT] Set-Cookie: %s", resp.headers.getall("Set-Cookie", []))
         self._dump_cookie_jar("NACH S1")
 
+        # Prüfen ob Session noch aktiv (SAMLResponse direkt da)
         saml_match = re.search(r'(?is)name=[\'"]SAMLResponse[\'"].*?value=[\'"]([^\'"]+)[\'"]', html)
         relay_match = re.search(r'(?is)name=[\'"]RelayState[\'"].*?value=[\'"]([^\'"]+)[\'"]', html)
 
@@ -208,85 +208,100 @@ class MinolOnlineClient:
             _LOGGER.debug("[S1-INIT] SAMLResponse direkt da (Session noch aktiv).")
             saml_response = saml_match.group(1)
             relay_state = relay_match.group(1) if relay_match else "ouccprfhrffau"
+
         else:
+            # === SCHRITT 2: CSRF + TX aus Azure B2C Login-Seite extrahieren ===
             csrf_match = re.search(r'"csrf"\s*:\s*"([^"]+)"', html)
             tx_match = re.search(r'"transId"\s*:\s*"([^"]+)"', html)
-            if not csrf_match or not tx_match:
-                _LOGGER.error("[S1-INIT] HTML (erste 500 Zeichen):\n%s", html[:500])
-                raise MinolAuthError("CSRF/TX Token nicht gefunden.")
-            csrf_token, tx_token = csrf_match.group(1), tx_match.group(1)
-            _LOGGER.debug("[S1-INIT] CSRF: %s... TX: %s...", csrf_token[:15], tx_token[:15])
 
-            # === SCHRITT 2: Credentials senden ===
-            status, headers, body = await self._request(
-                "POST",
+            if not csrf_match or not tx_match:
+                _LOGGER.error("[S2] CSRF/TX nicht gefunden. HTML (erste 500 Zeichen):\n%s", html[:500])
+                raise MinolAuthError("CSRF/TX Token nicht gefunden.")
+
+            csrf_token = csrf_match.group(1)
+            tx_token = tx_match.group(1)
+            _LOGGER.debug("[S2] CSRF: %s... | TX: %s...", csrf_token[:15], tx_token[:15])
+
+            # === SCHRITT 2: Credentials an Azure B2C senden ===
+            _LOGGER.debug("[S2-LOGIN] POST %s", SELF_ASSERTED_URL)
+            async with self._session.post(
                 SELF_ASSERTED_URL,
-                "S2-LOGIN",
                 params={"tx": tx_token, "p": B2C_POLICY},
                 data={"request_type": "RESPONSE", "signInName": self._username, "password": self._password},
                 headers={"X-CSRF-TOKEN": csrf_token, "X-Requested-With": "XMLHttpRequest"},
-            )
+                allow_redirects=False,
+            ) as resp:
+                body = await resp.text()
+                _LOGGER.debug("[S2-LOGIN] HTTP %s", resp.status)
+                if '"status":"400"' in body:
+                    _LOGGER.error("[S2-LOGIN] Login abgelehnt! Azure Antwort: %s", body)
+                    raise MinolAuthError("Login abgelehnt (E-Mail oder Passwort falsch).")
             self._dump_cookie_jar("NACH S2")
-            if '"status":"400"' in body:
-                raise MinolAuthError("Login abgelehnt (E-Mail oder Passwort falsch).")
 
-            # === SCHRITT 3: SAMLResponse abholen ===
-            conf_url = f"{CONFIRMED_URL}?rememberMe=false&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
-            status, headers, conf_html = await self._request("GET", conf_url, "S3-CONFIRMED", headers=BROWSER_HEADERS)
+            # === SCHRITT 3: SAMLResponse vom Confirmed-Endpoint ===
+            conf_url = (
+                f"{CONFIRMED_URL}?rememberMe=false"
+                f"&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
+            )
+            _LOGGER.debug("[S3-CONFIRMED] GET %s", conf_url)
+            async with self._session.get(conf_url, headers=BROWSER_HEADERS, allow_redirects=True) as resp:
+                conf_html = await resp.text()
+                _LOGGER.debug("[S3-CONFIRMED] HTTP %s | Final-URL: %s", resp.status, resp.url)
             self._dump_cookie_jar("NACH S3")
 
             saml_match = re.search(r'(?is)name=[\'"]SAMLResponse[\'"].*?value=[\'"]([^\'"]+)[\'"]', conf_html)
             if not saml_match:
                 _LOGGER.error("[S3-CONFIRMED] SAMLResponse fehlt. HTML:\n%s", conf_html[:800])
                 raise MinolAuthError("SAMLResponse fehlt.")
+
             saml_response = saml_match.group(1)
             relay_match = re.search(r'(?is)name=[\'"]RelayState[\'"].*?value=[\'"]([^\'"]+)[\'"]', conf_html)
             relay_state = relay_match.group(1) if relay_match else "ouccprfhrffau"
             _LOGGER.debug("[S3-CONFIRMED] SAMLResponse: %d Zeichen | RelayState: %s", len(saml_response), relay_state)
 
-        # === SCHRITT 4: SAMLResponse an SAP ACS senden (MANUELLER REDIRECT) ===
-        _LOGGER.debug("--- Starte manuelle Redirect-Kette ab ACS ---")
-        acs_body = await self._follow_redirects(
+        # === SCHRITT 4: SAMLResponse an SAP ACS - MANUELLE REDIRECTS ===
+        _LOGGER.debug("[S4-ACS] Starte POST + manuelle Redirect-Kette...")
+        acs_body = await self._follow_redirects_from_post(
             ACS_URL,
-            "POST",
             "S4-ACS",
-            data={"SAMLResponse": saml_response, "RelayState": relay_state},
-            headers=BROWSER_HEADERS,
+            post_data={"SAMLResponse": saml_response, "RelayState": relay_state},
         )
-        self._dump_cookie_jar("NACH S4 (nach allen Redirects)")
+        self._dump_cookie_jar("NACH S4")
 
-        # Prüfen ob SAP das SAMLResponse nochmal weiterleiten will
+        # Prüfen ob SAP nochmals ein Formular mit SAMLResponse liefert
         form_action_match = re.search(r'(?is)<form[^>]+action=[\'"]([^\'"]+)[\'"]', acs_body)
         inner_saml_match = re.search(r'(?is)name=[\'"]SAMLResponse[\'"].*?value=[\'"]([^\'"]+)[\'"]', acs_body)
+
         if form_action_match and inner_saml_match:
             next_action = form_action_match.group(1)
-            if next_action.startswith("/"): next_action = SAP_HOST + next_action
+            if next_action.startswith("/"):
+                next_action = SAP_HOST + next_action
             next_saml = inner_saml_match.group(1)
             next_relay_match = re.search(r'(?is)name=[\'"]RelayState[\'"].*?value=[\'"]([^\'"]+)[\'"]', acs_body)
             next_relay = next_relay_match.group(1) if next_relay_match else relay_state
-            _LOGGER.debug("[S4-ACS] SAP will weiteres Formular senden an: %s", next_action)
+            saml2post_match = re.search(r'(?is)name=[\'"]saml2post[\'"].*?value=[\'"]([^\'"]+)[\'"]', acs_body)
+            saml2post = saml2post_match.group(1) if saml2post_match else "false"
 
-            # === SCHRITT 5: App-Login (MANUELLER REDIRECT) ===
-            app_body = await self._follow_redirects(
+            _LOGGER.debug("[S5-APPLOGIN] SAP will weiteres Formular an: %s", next_action)
+
+            # === SCHRITT 5: App-Login - MANUELLE REDIRECTS ===
+            app_body = await self._follow_redirects_from_post(
                 next_action,
-                "POST",
                 "S5-APPLOGIN",
-                data={"SAMLResponse": next_saml, "RelayState": next_relay, "saml2post": "false"},
-                headers=BROWSER_HEADERS,
+                post_data={"SAMLResponse": next_saml, "RelayState": next_relay, "saml2post": saml2post},
             )
-            self._dump_cookie_jar("NACH S5 (nach allen Redirects)")
+            self._dump_cookie_jar("NACH S5")
         else:
-            _LOGGER.debug("[S4-ACS] Kein weiteres SAP-Formular im ACS-Body. Body-Auszug:\n%s", acs_body[:300])
+            _LOGGER.debug("[S4-ACS] Kein weiteres SAP-Formular im ACS-Body.")
 
         _LOGGER.debug("=" * 60)
         _LOGGER.debug("=== AUTHENTICATION FLOW ABGESCHLOSSEN ===")
         self._dump_cookie_jar("FINAL")
 
-        # Prüfung auf MYSAPSSO2
-        all_cookies = {c.key for c in self._session.cookie_jar}
-        if "MYSAPSSO2" in all_cookies:
+        all_cookie_names = {c.key for c in self._session.cookie_jar}
+        if "MYSAPSSO2" in all_cookie_names:
             _LOGGER.debug("[AUTH] MYSAPSSO2 Cookie erfolgreich gesetzt!")
         else:
-            _LOGGER.warning("[AUTH] MYSAPSSO2 Cookie fehlt. API-Calls werden wahrscheinlich fehlschlagen.")
+            _LOGGER.warning("[AUTH] MYSAPSSO2 Cookie fehlt nach Login!")
 
         self._is_authenticated = True
