@@ -13,9 +13,15 @@ SELF_ASSERTED_URL = f"{B2C_HOST}/minolauth.onmicrosoft.com/{B2C_POLICY}/SelfAsse
 CONFIRMED_URL = f"{B2C_HOST}/minolauth.onmicrosoft.com/{B2C_POLICY}/api/CombinedSigninAndSignup/confirmed"
 ACS_URL = f"{SAP_HOST}/saml2/sp/acs"
 APP_LOGIN_URL = f"{SAP_HOST}/minol.com~kundenportal~login~saml/?logonTargetUrl=https%3A%2F%2Fwebservices.minol.com%2F%3Fredirect2%3Dtrue&saml2idp=B2C-Minol-Tenant"
-
 TENANTS_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/getUserTenants"
 READ_DATA_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/readData"
+
+# Standard-Browser-Header, um nicht von der Firewall (Azure/SAP) blockiert zu werden
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 
 class MinolAuthError(Exception): pass
 class MinolConnectionError(Exception): pass
@@ -32,6 +38,7 @@ class MinolOnlineClient:
             await self._authenticate()
             
         headers = {
+            "User-Agent": BROWSER_HEADERS["User-Agent"],
             "X-Requested-With": "XMLHttpRequest", 
             "Accept": "application/json", 
             "Content-Type": "application/json; charset=UTF-8"
@@ -76,6 +83,7 @@ class MinolOnlineClient:
         cons_types = ["HZKWH", "WW", "KW"] 
 
         headers = {
+            "User-Agent": BROWSER_HEADERS["User-Agent"],
             "X-Requested-With": "XMLHttpRequest", 
             "Accept": "application/json, text/javascript, */*; q=0.01", 
             "Content-Type": "application/json; charset=UTF-8"
@@ -106,15 +114,17 @@ class MinolOnlineClient:
         return all_meters
 
     async def _authenticate(self):
-        # 1. Init URL abrufen
-        async with self._session.get(INIT_URL) as resp:
+        # 1. Init URL abrufen (getarnt als Browser)
+        async with self._session.get(INIT_URL, headers=BROWSER_HEADERS) as resp:
             html = await resp.text()
 
         # 2. Token extrahieren
         csrf_match = re.search(r'"csrf"\s*:\s*"([^"]+)"', html)
         tx_match = re.search(r'"transId"\s*:\s*"([^"]+)"', html)
+        
         if not csrf_match or not tx_match: 
-            _LOGGER.error("Step 1 Fehlgeschlagen: CSRF oder TX Token auf Azure B2C Seite nicht gefunden!")
+            _LOGGER.error(f"Step 1 Fehlgeschlagen! HTTP Status: {resp.status} | Ziel-URL: {resp.url}")
+            _LOGGER.error(f"HTML Auszug (erste 800 Zeichen):\n{html[:800]}")
             raise MinolAuthError("CSRF/TX nicht gefunden.")
         
         csrf_token, tx_token = csrf_match.group(1), tx_match.group(1)
@@ -123,6 +133,7 @@ class MinolOnlineClient:
         auth_params = {"tx": tx_token, "p": B2C_POLICY}
         auth_data = f"request_type=RESPONSE&signInName={urllib.parse.quote(self._username)}&password={urllib.parse.quote(self._password)}"
         auth_headers = {
+            "User-Agent": BROWSER_HEADERS["User-Agent"],
             "X-CSRF-TOKEN": csrf_token, 
             "X-Requested-With": "XMLHttpRequest", 
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
@@ -136,12 +147,13 @@ class MinolOnlineClient:
 
         # 4. SAML Token abholen
         conf_url = f"{CONFIRMED_URL}?rememberMe=false&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
-        async with self._session.get(conf_url) as resp:
+        async with self._session.get(conf_url, headers=BROWSER_HEADERS) as resp:
             conf_html = await resp.text()
 
+        # Verbessertes Regex (wie in deinem PowerShell Script)
         saml_match = re.search(r'(?is)name=[\'"]SAMLResponse[\'"].*?value=[\'"]([^\'"]+)[\'"]', conf_html)
         if not saml_match: 
-            _LOGGER.error("Step 3 Fehlgeschlagen: SAML Response Token nicht auf confirmed-Seite gefunden!")
+            _LOGGER.error(f"Step 3 Fehlgeschlagen: SAML Response Token fehlt! HTML:\n{conf_html[:800]}")
             raise MinolAuthError("SAMLResponse fehlt.")
         saml_response = saml_match.group(1)
         
@@ -149,7 +161,8 @@ class MinolOnlineClient:
         relay_state = relay_match.group(1) if relay_match else "ouccprfhrffau"
 
         # 5. SAP ACS Auth
-        await self._session.post(ACS_URL, data={"SAMLResponse": saml_response, "RelayState": relay_state})
-        await self._session.post(APP_LOGIN_URL, data={"SAMLResponse": saml_response, "RelayState": relay_state, "saml2post": "false"})
+        acs_headers = {"User-Agent": BROWSER_HEADERS["User-Agent"]}
+        await self._session.post(ACS_URL, data={"SAMLResponse": saml_response, "RelayState": relay_state}, headers=acs_headers)
+        await self._session.post(APP_LOGIN_URL, data={"SAMLResponse": saml_response, "RelayState": relay_state, "saml2post": "false"}, headers=acs_headers)
         
         self._is_authenticated = True
