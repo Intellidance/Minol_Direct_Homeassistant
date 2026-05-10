@@ -1,4 +1,4 @@
-import logging, re, urllib.parse, json, asyncio, random
+import logging, re
 from datetime import datetime
 from aiohttp import ClientSession
 
@@ -13,15 +13,14 @@ SELF_ASSERTED_URL = f"{B2C_HOST}/minolauth.onmicrosoft.com/{B2C_POLICY}/SelfAsse
 CONFIRMED_URL = f"{B2C_HOST}/minolauth.onmicrosoft.com/{B2C_POLICY}/api/CombinedSigninAndSignup/confirmed"
 ACS_URL = f"{SAP_HOST}/saml2/sp/acs"
 APP_LOGIN_URL = f"{SAP_HOST}/minol.com~kundenportal~login~saml/?logonTargetUrl=https%3A%2F%2Fwebservices.minol.com%2F%3Fredirect2%3Dtrue&saml2idp=B2C-Minol-Tenant"
-FINAL_REDIRECT_URL = f"{SAP_HOST}/?redirect2=true"
 
 TENANTS_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/getUserTenants"
 READ_DATA_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/readData"
 
+# Simuliert das Verhalten von Invoke-WebRequest (ohne JS)
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "*/*",
 }
 
 class MinolAuthError(Exception): pass
@@ -38,10 +37,7 @@ class MinolOnlineClient:
         if not self._is_authenticated:
             await self._authenticate()
             
-        await asyncio.sleep(random.uniform(0.3, 0.7))
-            
         headers = {
-            "User-Agent": BROWSER_HEADERS["User-Agent"], 
             "X-Requested-With": "XMLHttpRequest", 
             "Accept": "application/json, text/javascript, */*; q=0.01"
         }
@@ -50,12 +46,13 @@ class MinolOnlineClient:
             text = await resp.text()
             if resp.status == 200:
                 try:
+                    import json
                     return json.loads(text)
-                except json.JSONDecodeError:
-                    _LOGGER.error(f"API lieferte kein gültiges JSON für Tenants. Status: {resp.status}")
-                    _LOGGER.error(f"HTML Antwort:\n{text[:800]}")
+                except Exception as e:
+                    _LOGGER.error("Konnte Tenant-JSON nicht parsen.")
+                    _LOGGER.debug(f"HTML Antwort statt JSON:\n{text[:1000]}")
             else:
-                _LOGGER.error(f"Fehler beim Abruf der Tenants: HTTP {resp.status}.")
+                _LOGGER.error(f"Fehler beim Abruf der Tenants: HTTP {resp.status}")
         return []
 
     async def async_fetch_data(self):
@@ -64,12 +61,12 @@ class MinolOnlineClient:
             
         tenants = await self.async_get_user_tenants()
         if not tenants:
-            _LOGGER.debug("Token möglicherweise abgelaufen. Re-Auth...")
+            _LOGGER.debug("Re-Auth Versuch, da keine Tenants gefunden wurden.")
             self._is_authenticated = False
             await self._authenticate()
             tenants = await self.async_get_user_tenants()
             if not tenants:
-                raise MinolConnectionError("Keine Nutzeinheiten gefunden oder Login fehlgeschlagen.")
+                raise MinolConnectionError("Keine Nutzeinheiten (Tenants) gefunden.")
 
         all_meters = []
         for tenant in tenants:
@@ -90,14 +87,12 @@ class MinolOnlineClient:
         cons_types = ["HZKWH", "WW", "KW"] 
 
         headers = {
-            "User-Agent": BROWSER_HEADERS["User-Agent"],
             "X-Requested-With": "XMLHttpRequest", 
             "Accept": "application/json, text/javascript, */*; q=0.01", 
             "Content-Type": "application/json; charset=UTF-8"
         }
 
         for c_type in cons_types:
-            await asyncio.sleep(random.uniform(0.2, 0.6))
             payload = {
                 "userNum": user_num, "layer": "NE", "scale": "CALMONTH", "chartRefUnit": "ABS",
                 "refObject": "DIN_AVG", "consType": c_type, "dashBoardKey": "PE",
@@ -106,9 +101,10 @@ class MinolOnlineClient:
             }
             try:
                 async with self._session.post(READ_DATA_URL, json=payload, headers=headers) as resp:
-                    text = await resp.text()
                     if resp.status == 403: continue 
+                    text = await resp.text()
                     try:
+                        import json
                         json_resp = json.loads(text)
                         if "table" in json_resp:
                             for row in json_resp["table"]:
@@ -116,94 +112,76 @@ class MinolOnlineClient:
                                 row["_tenant_info"] = tenant_info
                                 all_meters.append(row)
                     except json.JSONDecodeError:
-                        _LOGGER.error(f"Kein gültiges JSON für Typ {c_type}. Antwort: {text[:300]}")
+                        _LOGGER.error(f"Kein gültiges JSON für Typ {c_type}.")
             except Exception as e:
                 _LOGGER.error(f"Fehler beim Abruf für Typ {c_type}: {e}")
                 
         return all_meters
 
     async def _authenticate(self):
-        # 1. Start URL abrufen
+        _LOGGER.debug("Schritt 1: Initialisiere SAML Flow...")
         async with self._session.get(INIT_URL, headers=BROWSER_HEADERS) as resp:
             html = await resp.text()
 
+        # Check ob Session eventuell schon aktiv (SAML Response direkt da)
         saml_match = re.search(r'(?is)name=[\'"]SAMLResponse[\'"].*?value=[\'"]([^\'"]+)[\'"]', html)
         relay_match = re.search(r'(?is)name=[\'"]RelayState[\'"].*?value=[\'"]([^\'"]+)[\'"]', html)
         
         if saml_match:
-            _LOGGER.debug("Auto-Submit Formular erkannt! Überspringe Azure Login.")
             saml_response = saml_match.group(1)
             relay_state = relay_match.group(1) if relay_match else "ouccprfhrffau"
-            
         else:
-            # 2. Azure B2C Login
             csrf_match = re.search(r'"csrf"\s*:\s*"([^"]+)"', html)
             tx_match = re.search(r'"transId"\s*:\s*"([^"]+)"', html)
             
             if not csrf_match or not tx_match: 
-                raise MinolAuthError("SAML Flow fehlgeschlagen: CSRF/TX nicht gefunden.")
+                raise MinolAuthError("Fehler: Konnte CSRF-Token oder TX-State nicht finden.")
             
             csrf_token, tx_token = csrf_match.group(1), tx_match.group(1)
-            await asyncio.sleep(random.uniform(0.8, 1.8))
 
+            _LOGGER.debug("Schritt 2: Sende Credentials an Azure B2C...")
             auth_params = {"tx": tx_token, "p": B2C_POLICY}
-            auth_data = f"request_type=RESPONSE&signInName={urllib.parse.quote(self._username)}&password={urllib.parse.quote(self._password)}"
+            
+            # Hier übernimmt aiohttp das exakte URL-Encoding wie in PowerShell
+            auth_data = {
+                "request_type": "RESPONSE",
+                "signInName": self._username,
+                "password": self._password
+            }
             auth_headers = {
-                "User-Agent": BROWSER_HEADERS["User-Agent"],
                 "X-CSRF-TOKEN": csrf_token, 
-                "X-Requested-With": "XMLHttpRequest", 
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+                "X-Requested-With": "XMLHttpRequest"
             }
 
             async with self._session.post(SELF_ASSERTED_URL, params=auth_params, data=auth_data, headers=auth_headers) as resp:
                 resp_text = await resp.text()
-                if '"status":"400"' in resp_text:
-                    raise MinolAuthError("Login abgelehnt (Falsches Passwort).")
+                if '"status":"400"' in resp_text or '"status": "400"' in resp_text:
+                    raise MinolAuthError("Login fehlgeschlagen! E-Mail oder Passwort falsch.")
 
-            await asyncio.sleep(random.uniform(0.2, 0.6))
+            _LOGGER.debug("Schritt 3: Hole SAML-Ticket ab...")
             conf_url = f"{CONFIRMED_URL}?rememberMe=false&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
             async with self._session.get(conf_url, headers=BROWSER_HEADERS) as resp:
                 conf_html = await resp.text()
 
             saml_match = re.search(r'(?is)name=[\'"]SAMLResponse[\'"].*?value=[\'"]([^\'"]+)[\'"]', conf_html)
             if not saml_match: 
-                raise MinolAuthError("SAMLResponse fehlt im Confirmed-Endpoint.")
+                raise MinolAuthError("Fehler: Konnte SAMLResponse nicht aus dem HTML extrahieren.")
             
             saml_response = saml_match.group(1)
             relay_match = re.search(r'(?is)name=[\'"]RelayState[\'"].*?value=[\'"]([^\'"]+)[\'"]', conf_html)
             relay_state = relay_match.group(1) if relay_match else "ouccprfhrffau"
 
-        # 3. SAP Login-Sequenz (Exakt wie im funktionierenden PowerShell Skript)
-        acs_headers = {
-            "User-Agent": BROWSER_HEADERS["User-Agent"],
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
+        _LOGGER.debug("Schritt 4: Übergebe SAML-Ticket an SAP (ACS & APP LOGIN)...")
         
-        await asyncio.sleep(random.uniform(0.1, 0.3))
-        
-        # POST an ACS
+        # 1:1 Kopie von PS: Invoke-WebRequest -Uri $acsUrl -Method POST
         acs_data = {"SAMLResponse": saml_response, "RelayState": relay_state}
-        async with self._session.post(ACS_URL, data=acs_data, headers=acs_headers) as resp:
-            await resp.read() 
+        async with self._session.post(ACS_URL, data=acs_data, headers=BROWSER_HEADERS) as resp:
+            await resp.read() # Stellt sicher, dass das Resultat konsumiert und Cookies gespeichert werden
             
-        await asyncio.sleep(random.uniform(0.2, 0.5))
-        
-        # POST an SAP App URL
+        # 1:1 Kopie von PS: Invoke-WebRequest -Uri $sapAppUrl -Method POST
         app_data = {"SAMLResponse": saml_response, "saml2post": "false", "RelayState": relay_state}
-        async with self._session.post(APP_LOGIN_URL, data=app_data, headers=acs_headers) as resp:
+        async with self._session.post(APP_LOGIN_URL, data=app_data, headers=BROWSER_HEADERS) as resp:
             await resp.read()
 
-        await asyncio.sleep(random.uniform(0.2, 0.5))
-        
-        # Finaler GET auf die Startseite (Triggert die finale Session-Validierung bei SAP)
-        async with self._session.get(FINAL_REDIRECT_URL, headers=BROWSER_HEADERS) as resp:
-            await resp.read()
-
-        # Cookie Validierung
-        cookies = self._session.cookie_jar.filter_cookies(SAP_HOST)
-        if "MYSAPSSO2" in cookies:
-            _LOGGER.debug("SAML Login erfolgreich, SAP Session-Cookie (MYSAPSSO2) wurde gesetzt.")
-        else:
-            _LOGGER.warning("MYSAPSSO2 Cookie fehlt! Wenn der folgende API Request scheitert, ist der Login nicht vollständig abgeschlossen.")
-        
+        _LOGGER.debug("Login Flow abgeschlossen. Session bereit für API Calls.")
         self._is_authenticated = True
