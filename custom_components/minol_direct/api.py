@@ -1,4 +1,5 @@
-import logging, re, json, base64, urllib.parse
+import logging, re, json, base64
+import urllib.parse
 from datetime import datetime
 from aiohttp import ClientSession
 from yarl import URL
