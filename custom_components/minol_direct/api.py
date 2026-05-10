@@ -1,6 +1,7 @@
-import logging, re
+import logging, re, urllib.parse, json
 from datetime import datetime
 from aiohttp import ClientSession
+from yarl import URL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -17,10 +18,9 @@ APP_LOGIN_URL = f"{SAP_HOST}/minol.com~kundenportal~login~saml/?logonTargetUrl=h
 TENANTS_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/getUserTenants"
 READ_DATA_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/readData"
 
-# Simuliert das Verhalten von Invoke-WebRequest (ohne JS)
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept": "*/*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 }
 
 class MinolAuthError(Exception): pass
@@ -38,6 +38,7 @@ class MinolOnlineClient:
             await self._authenticate()
             
         headers = {
+            "User-Agent": BROWSER_HEADERS["User-Agent"], 
             "X-Requested-With": "XMLHttpRequest", 
             "Accept": "application/json, text/javascript, */*; q=0.01"
         }
@@ -46,11 +47,10 @@ class MinolOnlineClient:
             text = await resp.text()
             if resp.status == 200:
                 try:
-                    import json
                     return json.loads(text)
-                except Exception as e:
-                    _LOGGER.error("Konnte Tenant-JSON nicht parsen.")
-                    _LOGGER.debug(f"HTML Antwort statt JSON:\n{text[:1000]}")
+                except json.JSONDecodeError:
+                    _LOGGER.error(f"API lieferte kein gültiges JSON für Tenants. Status: {resp.status}")
+                    _LOGGER.debug(f"HTML Antwort:\n{text[:1000]}")
             else:
                 _LOGGER.error(f"Fehler beim Abruf der Tenants: HTTP {resp.status}")
         return []
@@ -87,6 +87,7 @@ class MinolOnlineClient:
         cons_types = ["HZKWH", "WW", "KW"] 
 
         headers = {
+            "User-Agent": BROWSER_HEADERS["User-Agent"],
             "X-Requested-With": "XMLHttpRequest", 
             "Accept": "application/json, text/javascript, */*; q=0.01", 
             "Content-Type": "application/json; charset=UTF-8"
@@ -104,7 +105,6 @@ class MinolOnlineClient:
                     if resp.status == 403: continue 
                     text = await resp.text()
                     try:
-                        import json
                         json_resp = json.loads(text)
                         if "table" in json_resp:
                             for row in json_resp["table"]:
@@ -118,12 +118,22 @@ class MinolOnlineClient:
                 
         return all_meters
 
+    def _extract_and_set_sap_cookie(self, html):
+        """Sucht im HTML nach dem versteckten SAP Cookie und setzt es manuell im CookieJar."""
+        match = re.search(r'(?i)name=[\'"]MYSAPSSO2[\'"].*?value=[\'"]([^\'"]+)[\'"]', html)
+        if match:
+            cookie_value = match.group(1)
+            # Cookie manuell in die aiohttp Session injizieren!
+            self._session.cookie_jar.update_cookies({"MYSAPSSO2": cookie_value}, URL(SAP_HOST))
+            _LOGGER.debug("Erfolg! MYSAPSSO2 Cookie manuell aus HTML extrahiert und gesetzt.")
+            return True
+        return False
+
     async def _authenticate(self):
         _LOGGER.debug("Schritt 1: Initialisiere SAML Flow...")
         async with self._session.get(INIT_URL, headers=BROWSER_HEADERS) as resp:
             html = await resp.text()
 
-        # Check ob Session eventuell schon aktiv (SAML Response direkt da)
         saml_match = re.search(r'(?is)name=[\'"]SAMLResponse[\'"].*?value=[\'"]([^\'"]+)[\'"]', html)
         relay_match = re.search(r'(?is)name=[\'"]RelayState[\'"].*?value=[\'"]([^\'"]+)[\'"]', html)
         
@@ -142,7 +152,6 @@ class MinolOnlineClient:
             _LOGGER.debug("Schritt 2: Sende Credentials an Azure B2C...")
             auth_params = {"tx": tx_token, "p": B2C_POLICY}
             
-            # Hier übernimmt aiohttp das exakte URL-Encoding wie in PowerShell
             auth_data = {
                 "request_type": "RESPONSE",
                 "signInName": self._username,
@@ -173,15 +182,15 @@ class MinolOnlineClient:
 
         _LOGGER.debug("Schritt 4: Übergebe SAML-Ticket an SAP (ACS & APP LOGIN)...")
         
-        # 1:1 Kopie von PS: Invoke-WebRequest -Uri $acsUrl -Method POST
         acs_data = {"SAMLResponse": saml_response, "RelayState": relay_state}
         async with self._session.post(ACS_URL, data=acs_data, headers=BROWSER_HEADERS) as resp:
-            await resp.read() # Stellt sicher, dass das Resultat konsumiert und Cookies gespeichert werden
+            acs_html = await resp.text()
+            self._extract_and_set_sap_cookie(acs_html)
             
-        # 1:1 Kopie von PS: Invoke-WebRequest -Uri $sapAppUrl -Method POST
         app_data = {"SAMLResponse": saml_response, "saml2post": "false", "RelayState": relay_state}
         async with self._session.post(APP_LOGIN_URL, data=app_data, headers=BROWSER_HEADERS) as resp:
-            await resp.read()
+            app_html = await resp.text()
+            self._extract_and_set_sap_cookie(app_html)
 
         _LOGGER.debug("Login Flow abgeschlossen. Session bereit für API Calls.")
         self._is_authenticated = True
