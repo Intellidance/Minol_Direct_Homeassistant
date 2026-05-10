@@ -14,7 +14,6 @@ CONFIRMED_URL = f"{B2C_HOST}/minolauth.onmicrosoft.com/{B2C_POLICY}/api/Combined
 ACS_URL = f"{SAP_HOST}/saml2/sp/acs"
 APP_LOGIN_URL = f"{SAP_HOST}/minol.com~kundenportal~login~saml/?logonTargetUrl=https%3A%2F%2Fwebservices.minol.com%2F%3Fredirect2%3Dtrue&saml2idp=B2C-Minol-Tenant"
 
-#Tenant-API
 TENANTS_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/getUserTenants"
 READ_DATA_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/readData"
 
@@ -29,7 +28,6 @@ class MinolOnlineClient:
         self._is_authenticated = False
 
     async def async_get_user_tenants(self):
-        """Authentifiziert und holt die Liste aller Nutzeinheiten/Wohnungen des Benutzers."""
         if not self._is_authenticated:
             await self._authenticate()
             
@@ -49,23 +47,20 @@ class MinolOnlineClient:
         return []
 
     async def async_fetch_data(self):
-        """Holt die Zählerstände für alle gefundenen Wohnungen."""
         if not self._is_authenticated:
             await self._authenticate()
             
         tenants = await self.async_get_user_tenants()
         if not tenants:
-            # Fallback: Erneuter Auth-Versuch bei Cookie-Ablauf
             await self._authenticate()
             tenants = await self.async_get_user_tenants()
             if not tenants:
-                raise MinolConnectionError("Datenabruf fehlgeschlagen. Keine Nutzeinheiten (Wohnungen) gefunden.")
+                raise MinolConnectionError("Keine Nutzeinheiten gefunden.")
 
         all_meters = []
         for tenant in tenants:
             user_num = tenant.get("userNumber")
-            if not user_num:
-                continue
+            if not user_num: continue
             
             meters = await self._fetch_all_mediums(user_num, tenant)
             if meters:
@@ -74,7 +69,6 @@ class MinolOnlineClient:
         return {"meters": all_meters, "fetched_at": datetime.now().isoformat()}
 
     async def _fetch_all_mediums(self, user_num, tenant_info):
-        """Holt die Zählerdaten (Heizung, WW, KW) für eine spezifische Kundennummer."""
         all_meters = []
         now = datetime.now()
         start_date = f"{now.year - 1}01"
@@ -104,7 +98,7 @@ class MinolOnlineClient:
                     if "table" in json_resp:
                         for row in json_resp["table"]:
                             row["_ha_medium_type"] = c_type
-                            row["_tenant_info"] = tenant_info # Wohnungsdaten für Sensor-Attribute anhängen
+                            row["_tenant_info"] = tenant_info
                             all_meters.append(row)
             except Exception as e:
                 _LOGGER.error("Fehler beim Abruf für Typ %s (userNum %s): %s", c_type, user_num, e)
@@ -112,16 +106,20 @@ class MinolOnlineClient:
         return all_meters
 
     async def _authenticate(self):
+        # 1. Init URL abrufen
         async with self._session.get(INIT_URL) as resp:
             html = await resp.text()
 
+        # 2. Token extrahieren
         csrf_match = re.search(r'"csrf"\s*:\s*"([^"]+)"', html)
         tx_match = re.search(r'"transId"\s*:\s*"([^"]+)"', html)
         if not csrf_match or not tx_match: 
+            _LOGGER.error("Step 1 Fehlgeschlagen: CSRF oder TX Token auf Azure B2C Seite nicht gefunden!")
             raise MinolAuthError("CSRF/TX nicht gefunden.")
         
         csrf_token, tx_token = csrf_match.group(1), tx_match.group(1)
 
+        # 3. Anmeldedaten posten
         auth_params = {"tx": tx_token, "p": B2C_POLICY}
         auth_data = f"request_type=RESPONSE&signInName={urllib.parse.quote(self._username)}&password={urllib.parse.quote(self._password)}"
         auth_headers = {
@@ -131,21 +129,27 @@ class MinolOnlineClient:
         }
 
         async with self._session.post(SELF_ASSERTED_URL, params=auth_params, data=auth_data, headers=auth_headers) as resp:
-            if '"status":"400"' in await resp.text(): 
-                raise MinolAuthError("Login abgelehnt.")
+            resp_text = await resp.text()
+            if '"status":"400"' in resp_text:
+                _LOGGER.error(f"Step 2 Fehlgeschlagen: Login von Minol/Azure abgelehnt! Server Antwort: {resp_text}")
+                raise MinolAuthError(f"Login abgelehnt (Falsches Passwort?). API sagt: {resp_text}")
 
+        # 4. SAML Token abholen
         conf_url = f"{CONFIRMED_URL}?rememberMe=false&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
         async with self._session.get(conf_url) as resp:
             conf_html = await resp.text()
 
         saml_match = re.search(r'(?is)name=[\'"]SAMLResponse[\'"].*?value=[\'"]([^\'"]+)[\'"]', conf_html)
         if not saml_match: 
+            _LOGGER.error("Step 3 Fehlgeschlagen: SAML Response Token nicht auf confirmed-Seite gefunden!")
             raise MinolAuthError("SAMLResponse fehlt.")
         saml_response = saml_match.group(1)
         
         relay_match = re.search(r'(?is)name=[\'"]RelayState[\'"].*?value=[\'"]([^\'"]+)[\'"]', conf_html)
         relay_state = relay_match.group(1) if relay_match else "ouccprfhrffau"
 
+        # 5. SAP ACS Auth
         await self._session.post(ACS_URL, data={"SAMLResponse": saml_response, "RelayState": relay_state})
         await self._session.post(APP_LOGIN_URL, data={"SAMLResponse": saml_response, "RelayState": relay_state, "saml2post": "false"})
+        
         self._is_authenticated = True
