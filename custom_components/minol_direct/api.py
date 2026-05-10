@@ -218,11 +218,8 @@ class MinolOnlineClient:
     async def _authenticate(self) -> None:
         _LOGGER.debug("=" * 60)
         _LOGGER.debug("=== STARTE AUTHENTICATION FLOW ===")
-        _LOGGER.debug("=" * 60)
 
-        # === SCHRITT 1a: INIT_URL ohne Redirect abrufen ===
-        # Wir wollen die Azure B2C URL RAW aus dem Location-Header,
-        # OHNE dass yarl sie normalisiert (würde SAML-Signatur zerstören!)
+        # === SCHRITT 1a: INIT_URL - OHNE automatischen Redirect ===
         _LOGGER.debug("[S1a] GET %s (allow_redirects=FALSE)", INIT_URL)
         async with self._session.get(
             INIT_URL,
@@ -232,7 +229,7 @@ class MinolOnlineClient:
             sap_redirect_url = resp.headers.get("Location", "")
             set_cookies = resp.headers.getall("Set-Cookie", [])
             _LOGGER.debug(
-                "[S1a] HTTP %s | Azure B2C URL: %s... | Set-Cookie: %d",
+                "[S1a] HTTP %s | Redirect zu Azure B2C: %s... | Set-Cookie: %d",
                 resp.status, sap_redirect_url[:80], len(set_cookies),
             )
             for sc in set_cookies:
@@ -242,8 +239,6 @@ class MinolOnlineClient:
             raise MinolAuthError("SAP sendete keinen Redirect zu Azure B2C!")
 
         # === SCHRITT 1b: Azure B2C aufrufen mit encoded=True ===
-        # encoded=True sagt yarl: "Diese URL ist bereits korrekt kodiert, NICHT anfassen!"
-        # Dadurch bleibt die SAML-Signatur in den URL-Parametern intakt.
         _LOGGER.debug("[S1b] GET Azure B2C URL (encoded=True, allow_redirects=True)")
         azure_url = URL(sap_redirect_url, encoded=True)
         async with self._session.get(
@@ -252,11 +247,12 @@ class MinolOnlineClient:
             allow_redirects=True,
         ) as resp:
             html = await resp.text()
-            _LOGGER.debug("[S1b] Final-URL: %s | HTTP %s", resp.url, resp.status)
+            azure_final_url = str(resp.url)
+            _LOGGER.debug("[S1b] Final-URL: %s | HTTP %s", azure_final_url, resp.status)
             _LOGGER.debug("[S1b] Set-Cookie: %s", resp.headers.getall("Set-Cookie", []))
         self._dump_cookie_jar("NACH S1")
 
-        # Prüfung: Ist bereits eine VALIDE SAMLResponse da? (Nur SUCCESS zählt!)
+        # Prüfung: Ist bereits eine VALIDE SAMLResponse da?
         saml_match = re.search(r'(?is)name=[\'"]SAMLResponse[\'"].*?value=[\'"]([^\'"]+)[\'"]', html)
         relay_match = re.search(r'(?is)name=[\'"]RelayState[\'"].*?value=[\'"]([^\'"]+)[\'"]', html)
 
@@ -272,12 +268,12 @@ class MinolOnlineClient:
             if saml_match:
                 _LOGGER.debug("[S1b] SAMLResponse gefunden, aber ist FEHLER-Response. Führe normalen Login durch.")
 
-            # === SCHRITT 2: CSRF + TX aus Azure B2C Login-Seite extrahieren ===
+            # === SCHRITT 2: CSRF + TX aus Azure B2C Seite extrahieren ===
             csrf_match = re.search(r'"csrf"\s*:\s*"([^"]+)"', html)
             tx_match = re.search(r'"transId"\s*:\s*"([^"]+)"', html)
 
             if not csrf_match or not tx_match:
-                _LOGGER.error("[S2] CSRF/TX nicht gefunden. HTML (erste 500 Zeichen):\n%s", html[:500])
+                _LOGGER.error("[S2] CSRF/TX nicht gefunden. HTML:\n%s", html[:500])
                 raise MinolAuthError("CSRF/TX Token nicht gefunden.")
 
             csrf_token = csrf_match.group(1)
@@ -285,8 +281,6 @@ class MinolOnlineClient:
             _LOGGER.debug("[S2] CSRF: %s... | TX: %s...", csrf_token[:15], tx_token[:15])
 
             # === SCHRITT 2: Credentials an Azure B2C senden ===
-            # Exakt wie PowerShell: urllib.parse.quote() = [uri]::EscapeDataString()
-            # Wichtig: safe='' damit auch @, +, etc. enkodiert werden
             auth_body_str = (
                 f"request_type=RESPONSE"
                 f"&signInName={urllib.parse.quote(self._username, safe='')}"
@@ -297,30 +291,35 @@ class MinolOnlineClient:
                 urllib.parse.quote(self._username, safe=''),
             )
 
+            # Die absolut kritischen Header für Azure B2C (Schutz vor CSRF)
+            auth_headers = {
+                "User-Agent": BROWSER_HEADERS["User-Agent"],
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": B2C_HOST,
+                "Referer": azure_final_url,
+                "X-CSRF-TOKEN": csrf_token,
+                "X-Requested-With": "XMLHttpRequest"
+            }
+
             async with self._session.post(
                 SELF_ASSERTED_URL,
                 params={"tx": tx_token, "p": B2C_POLICY},
                 data=auth_body_str,
-                headers={
-                    "User-Agent": BROWSER_HEADERS["User-Agent"],
-                    "X-CSRF-TOKEN": csrf_token,
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                },
+                headers=auth_headers,
                 allow_redirects=False,
-            ) as resp:
-                body = await resp.text()
-                _LOGGER.debug("[S2] HTTP %s | Response Body: %s", resp.status, body[:300])
+            ) as resp2:
+                body = await resp2.text()
+                _LOGGER.debug("[S2] HTTP %s | Response Body: %s", resp2.status, body[:300])
 
-                # HTTP 400 = malformed request (CSRF, Format, User-Agent Problem)
-                if resp.status == 400:
+                if resp2.status == 400:
                     _LOGGER.error("[S2] HTTP 400 von Azure B2C! Vollständiger Body:\n%s", body)
                     raise MinolAuthError(
                         f"Azure B2C lehnt Authentifizierungsanfrage ab (HTTP 400). "
-                        f"Mögliche Ursache: CSRF-Problem oder falsches Format. Body: {body[:200]}"
+                        f"Mögliche Ursache: CSRF-Problem oder fehlende Header. Body: {body[:200]}"
                     )
 
-                # HTTP 200 mit JSON-Status 400 = falsche Credentials
                 if '"status":"400"' in body or '"status": "400"' in body:
                     _LOGGER.error("[S2] Zugangsdaten abgelehnt! Azure Antwort: %s", body)
                     raise MinolAuthError("Login abgelehnt (E-Mail oder Passwort falsch).")
@@ -329,10 +328,7 @@ class MinolOnlineClient:
             self._dump_cookie_jar("NACH S2")
 
             # === SCHRITT 3: SAMLResponse vom Confirmed-Endpoint ===
-            conf_url = (
-                f"{CONFIRMED_URL}?rememberMe=false"
-                f"&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
-            )
+            conf_url = f"{CONFIRMED_URL}?rememberMe=false&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
             _LOGGER.debug("[S3] GET Confirmed: %s", conf_url)
             async with self._session.get(
                 conf_url,
@@ -362,7 +358,6 @@ class MinolOnlineClient:
                 len(saml_response), relay_state,
             )
 
-            # Prüfe ob auch diese SAMLResponse ein Erfolg ist
             if not self._is_saml_success(saml_response):
                 raise MinolAuthError("SAMLResponse nach Login enthält Fehler-Status!")
 
@@ -420,3 +415,4 @@ class MinolOnlineClient:
             _LOGGER.warning("[AUTH] MYSAPSSO2 Cookie fehlt nach Login!")
 
         self._is_authenticated = True
+
