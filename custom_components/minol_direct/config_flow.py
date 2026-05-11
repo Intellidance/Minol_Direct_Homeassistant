@@ -1,7 +1,6 @@
 import logging
 import voluptuous as vol
 from homeassistant import config_entries
-import aiohttp
 
 from .api import MinolAuthError, MinolConnectionError, MinolOnlineClient
 from .const import CONF_PASSWORD, CONF_USERNAME, DOMAIN
@@ -21,37 +20,34 @@ class MinolOnlineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(username.lower())
             self._abort_if_unique_id_configured()
 
-            jar = aiohttp.CookieJar(unsafe=True)
+            client = MinolOnlineClient(username, password)
+            try:
+                # Login durchführen und Wohnungen abrufen
+                tenants = await client.async_get_user_tenants()
 
-            async with aiohttp.ClientSession(cookie_jar=jar) as session:
-                client = MinolOnlineClient(username, password, session)
-                try:
-                    # Login durchführen und Wohnungen abrufen
-                    tenants = await client.async_get_user_tenants()
-                    
-                    if not tenants:
-                        errors["base"] = "no_tenants"
-                    else:
-                        # Ermittle einen schönen Titel für die Integration
-                        t = tenants[0]
-                        street = t.get("addrStreet", "")
-                        house = t.get("addrHouseNum", "")
-                        title = f"Minol {street} {house}".strip()
-                        
-                        if len(tenants) > 1:
-                            title += f" (+{len(tenants)-1})"
-                        if not title:
-                            title = f"Minol ({username})"
+                if not tenants:
+                    errors["base"] = "no_tenants"
+                else:
+                    # Ermittle einen schönen Titel für die Integration
+                    t = tenants[0]
+                    street = t.get("addrStreet", "")
+                    house = t.get("addrHouseNum", "")
+                    title = f"Minol {street} {house}".strip()
 
-                        return self.async_create_entry(
-                            title=title,
-                            data={CONF_USERNAME: username, CONF_PASSWORD: password},
-                        )
-                except MinolAuthError:
-                    errors["base"] = "auth"
-                except Exception as err:
-                    _LOGGER.error("Verbindungsfehler im Config Flow: %s", err)
-                    errors["base"] = "cannot_connect"
+                    if len(tenants) > 1:
+                        title += f" (+{len(tenants)-1})"
+                    if not title:
+                        title = f"Minol ({username})"
+
+                    return self.async_create_entry(
+                        title=title,
+                        data={CONF_USERNAME: username, CONF_PASSWORD: password},
+                    )
+            except MinolAuthError:
+                errors["base"] = "auth"
+            except Exception as err:
+                _LOGGER.error("Verbindungsfehler im Config Flow: %s", err)
+                errors["base"] = "cannot_connect"
 
         return self.async_show_form(
             step_id="user",
