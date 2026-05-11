@@ -1,7 +1,11 @@
-import logging, re, json, base64, urllib.parse
+"""Minol Online API Client für Home Assistant.
+
+Nutzt requests.Session (statt aiohttp) weil aiohttp bei Azure B2C SelfAsserted POSTs
+einen HTTP 400 produziert, während requests problemlos funktioniert.
+Alle HTTP-Calls werden via asyncio.to_thread() ausgeführt für HA-Kompatibilität.
+"""
+import asyncio, logging, re, json, base64, urllib.parse, requests
 from datetime import datetime
-from aiohttp import ClientSession
-from yarl import URL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -13,57 +17,57 @@ INIT_URL = f"{SAP_HOST}/minol.com~kundenportal~login~saml/?logonTargetUrl=https%
 SELF_ASSERTED_URL = f"{B2C_HOST}/minolauth.onmicrosoft.com/{B2C_POLICY}/SelfAsserted"
 CONFIRMED_URL = f"{B2C_HOST}/minolauth.onmicrosoft.com/{B2C_POLICY}/api/CombinedSigninAndSignup/confirmed"
 ACS_URL = f"{SAP_HOST}/saml2/sp/acs"
-APP_LOGIN_URL = f"{SAP_HOST}/minol.com~kundenportal~login~saml/?logonTargetUrl=https%3A%2F%2Fwebservices.minol.com%2F%3Fredirect2%3Dtrue&saml2idp=B2C-Minol-Tenant"
 
 TENANTS_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/getUserTenants"
 READ_DATA_URL = f"{SAP_HOST}/minol.com~kundenportal~em~web/rest/EMData/readData"
 
-# Wir nutzen exakt den PowerShell User-Agent, da die Azure WAF diesen anstandslos durchlässt.
-PS_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.19045; de-DE) PowerShell/7.4.2"
-
 BROWSER_HEADERS = {
-    "User-Agent": PS_USER_AGENT
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
 
-class MinolAuthError(Exception): pass
-class MinolConnectionError(Exception): pass
+class MinolAuthError(Exception):
+    pass
+
+
+class MinolConnectionError(Exception):
+    pass
 
 
 class MinolOnlineClient:
-    def __init__(self, username: str, password: str, session: ClientSession) -> None:
+    """Async-kompatibler Minol API Client (nutzt requests intern via asyncio.to_thread)."""
+
+    def __init__(self, username: str, password: str, session: requests.Session | None = None) -> None:
         self._username = username
         self._password = password
-        self._session = session
+        self._session = session or requests.Session()
+        self._session.headers.update(BROWSER_HEADERS)
         self._is_authenticated = False
 
-    def _dump_cookie_jar(self, label: str) -> None:
-        """Gibt den kompletten Inhalt des Cookie-Jars aus."""
-        all_cookies = list(self._session.cookie_jar)
-        if not all_cookies:
+    def _dump_cookies(self, label: str) -> None:
+        """Gibt alle Cookies der Session aus."""
+        cookies = self._session.cookies
+        if not cookies:
             _LOGGER.debug("[COOKIES %s] Leer", label)
             return
-        _LOGGER.debug("[COOKIES %s] %d Cookies:", label, len(all_cookies))
-        for c in all_cookies:
+        _LOGGER.debug("[COOKIES %s] %d Cookies:", label, len(cookies))
+        for c in cookies:
             _LOGGER.debug(
                 "  -> %-20s | Domain: %-35s | Pfad: %s",
-                c.key,
-                c.get("domain", "?"),
-                c.get("path", "/"),
+                c.name, c.domain or "?", c.path or "/",
             )
 
     def _is_saml_success(self, saml_response_b64: str) -> bool:
-        """
-        Prüft ob ein Base64-enkodiertes SAMLResponse ein Erfolg ist
-        und kein Fehler (z.B. 'Invalid signature').
-        """
+        """Prüft ob eine Base64-kodierte SAMLResponse erfolgreich ist."""
         try:
             xml = base64.b64decode(saml_response_b64 + "==").decode("utf-8", errors="ignore")
             if "status:Success" in xml:
                 return True
             if "status:Requester" in xml or "status:Responder" in xml or "Invalid" in xml:
-                _LOGGER.warning("[SAML] SAMLResponse enthält Fehler-Status! Ignoriere diese Response.")
-                msg_match = re.search(r'<[^>]*StatusMessage[^>]*>([^<]+)<', xml)
+                _LOGGER.warning("[SAML] SAMLResponse enthält Fehler-Status!")
+                msg_match = re.search(r"<[^>]*StatusMessage[^>]*>([^<]+)<", xml)
                 if msg_match:
                     _LOGGER.warning("[SAML] StatusMessage: %s", msg_match.group(1))
                 return False
@@ -71,95 +75,64 @@ class MinolOnlineClient:
             _LOGGER.debug("[SAML] Konnte SAMLResponse nicht dekodieren: %s", e)
         return False
 
-    async def _post_no_redirect(self, url: str, label: str, **kwargs) -> tuple[int, dict, str]:
-        """POST ohne automatischen Redirect - gibt (status, headers, body) zurück."""
-        _LOGGER.debug("[%s] POST %s", label, url)
-        if "data" in kwargs and isinstance(kwargs["data"], dict):
-            safe = {k: ("***" if k.lower() == "password" else v) for k, v in kwargs["data"].items()}
-            _LOGGER.debug("[%s] Payload: %s", label, safe)
-
-        async with self._session.post(url, allow_redirects=False, **kwargs) as resp:
-            body = await resp.text()
-            location = resp.headers.get("Location", "")
-            set_cookies = resp.headers.getall("Set-Cookie", [])
-            _LOGGER.debug(
-                "[%s] → HTTP %s | Location: %s | Set-Cookie: %d",
-                label, resp.status, location or "–", len(set_cookies),
-            )
-            for sc in set_cookies:
-                _LOGGER.debug("[%s]   Set-Cookie: %s", label, sc)
-            return resp.status, dict(resp.headers), body
-
-    async def _follow_redirects_from_post(self, start_url: str, label: str, post_data: dict) -> str:
-        """
-        Führt einen POST aus und folgt dann allen Redirects manuell.
-        Gibt den finalen HTML-Body zurück.
-        Nutzt encoded=True damit yarl die URLs nicht normalisiert (SAML-Signatur!).
-        """
-        status, headers, body = await self._post_no_redirect(
-            start_url,
-            f"{label}-POST",
-            data=post_data,
-            headers=BROWSER_HEADERS,
+    def _follow_redirects_from_post(self, start_url: str, label: str, post_data: dict) -> str:
+        """POST ausführen und manuell allen Redirects folgen. Gibt finalen HTML-Body zurück."""
+        _LOGGER.debug("[%s-POST] POST %s", label, start_url)
+        resp = self._session.post(
+            start_url, data=post_data, headers=BROWSER_HEADERS,
+            allow_redirects=False,
         )
+        _LOGGER.debug("[%s-POST] → HTTP %s | Location: %s", label, resp.status_code, resp.headers.get("Location", "–"))
 
-        redirect_url = headers.get("Location", "")
+        redirect_url = resp.headers.get("Location", "")
         hop = 0
         max_hops = 10
+        body = resp.text
 
-        while redirect_url and status in (301, 302, 303, 307, 308) and hop < max_hops:
+        while redirect_url and resp.status_code in (301, 302, 303, 307, 308) and hop < max_hops:
             hop += 1
             if redirect_url.startswith("/"):
                 redirect_url = SAP_HOST + redirect_url
 
             _LOGGER.debug("[%s Hop%d] GET %s", label, hop, redirect_url)
-
-            # encoded=True = yarl NICHT normalisieren lassen (schützt SAML-Signaturen)
-            async with self._session.get(
-                URL(redirect_url, encoded=True),
-                headers=BROWSER_HEADERS,
-                allow_redirects=False,
-            ) as resp:
-                body = await resp.text()
-                status = resp.status
-                set_cookies = resp.headers.getall("Set-Cookie", [])
-                redirect_url = resp.headers.get("Location", "")
-                _LOGGER.debug(
-                    "[%s Hop%d] → HTTP %s | Next: %s | Set-Cookie: %d",
-                    label, hop, status, redirect_url or "–", len(set_cookies),
-                )
-                for sc in set_cookies:
-                    _LOGGER.debug("[%s Hop%d]   Set-Cookie: %s", label, hop, sc)
+            resp = self._session.get(
+                redirect_url, headers=BROWSER_HEADERS, allow_redirects=False,
+            )
+            body = resp.text
+            redirect_url = resp.headers.get("Location", "")
+            _LOGGER.debug(
+                "[%s Hop%d] → HTTP %s | Next: %s",
+                label, hop, resp.status_code, redirect_url or "–",
+            )
 
         return body
+
+    # ── Async Public API (für Home Assistant) ──────────────────────────
 
     async def async_get_user_tenants(self) -> list[dict]:
         if not self._is_authenticated:
             await self._authenticate()
 
         headers = {
-            "User-Agent": PS_USER_AGENT,
             "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json, text/javascript, */*; q=0.01",
         }
         _LOGGER.debug("[TENANTS] GET %s", TENANTS_URL)
-        self._dump_cookie_jar("VOR TENANTS")
 
-        async with self._session.get(TENANTS_URL, headers=headers) as resp:
-            text = await resp.text()
-            _LOGGER.debug(
-                "[TENANTS] HTTP %s | Content-Type: %s",
-                resp.status,
-                resp.headers.get("Content-Type", "?"),
-            )
-            if resp.status == 200:
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
-                    _LOGGER.error("[TENANTS] Kein JSON empfangen!")
-                    _LOGGER.debug("[TENANTS] Erste 300 Zeichen:\n%s", text[:300])
-            else:
-                _LOGGER.error("[TENANTS] HTTP Fehler: %s", resp.status)
+        def _do():
+            return self._session.get(TENANTS_URL, headers=headers)
+
+        resp = await asyncio.to_thread(_do)
+        text = resp.text
+        _LOGGER.debug("[TENANTS] HTTP %s | Content-Type: %s", resp.status_code, resp.headers.get("Content-Type", "?"))
+        if resp.status_code == 200:
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                _LOGGER.error("[TENANTS] Kein JSON empfangen!")
+                _LOGGER.debug("[TENANTS] Erste 300 Zeichen:\n%s", text[:300])
+        else:
+            _LOGGER.error("[TENANTS] HTTP Fehler: %s", resp.status_code)
         return []
 
     async def async_fetch_data(self) -> dict:
@@ -191,7 +164,6 @@ class MinolOnlineClient:
         start_date = f"{now.year - 1}01"
         end_date = now.strftime("%Y%m")
         headers = {
-            "User-Agent": PS_USER_AGENT,
             "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Content-Type": "application/json; charset=UTF-8",
@@ -204,55 +176,53 @@ class MinolOnlineClient:
                 "timelineEnd": end_date, "timelineEndTxt": "",
                 "valuesInKWH": True, "dlgKey": "100KWH",
             }
+
+            def _do():
+                return self._session.post(READ_DATA_URL, json=payload, headers=headers)
+
             try:
-                async with self._session.post(READ_DATA_URL, json=payload, headers=headers) as resp:
-                    if resp.status == 403:
-                        continue
-                    text = await resp.text()
-                    for row in json.loads(text).get("table", []):
-                        row["_ha_medium_type"] = c_type
-                        row["_tenant_info"] = tenant_info
-                        all_meters.append(row)
+                resp = await asyncio.to_thread(_do)
+                if resp.status_code == 403:
+                    continue
+                text = resp.text
+                for row in json.loads(text).get("table", []):
+                    row["_ha_medium_type"] = c_type
+                    row["_tenant_info"] = tenant_info
+                    all_meters.append(row)
             except Exception as e:
                 _LOGGER.error("[readData] Fehler für Typ %s: %s", c_type, e)
         return all_meters
+
+    # ── Authentication Flow ────────────────────────────────────────────
 
     async def _authenticate(self) -> None:
         _LOGGER.debug("=" * 60)
         _LOGGER.debug("=== STARTE AUTHENTICATION FLOW ===")
 
         # === SCHRITT 1a: INIT_URL - OHNE automatischen Redirect ===
-        _LOGGER.debug("[S1a] GET %s (allow_redirects=FALSE)", INIT_URL)
-        async with self._session.get(
-            INIT_URL,
-            headers=BROWSER_HEADERS,
-            allow_redirects=False,
-        ) as resp:
-            sap_redirect_url = resp.headers.get("Location", "")
-            set_cookies = resp.headers.getall("Set-Cookie", [])
-            _LOGGER.debug(
-                "[S1a] HTTP %s | Redirect zu Azure B2C: %s... | Set-Cookie: %d",
-                resp.status, sap_redirect_url[:80], len(set_cookies),
-            )
-            for sc in set_cookies:
-                _LOGGER.debug("[S1a]   Set-Cookie: %s", sc)
+        _LOGGER.debug("[S1a] GET %s (allow_redirects=False)", INIT_URL)
+
+        def _s1a():
+            return self._session.get(INIT_URL, allow_redirects=False)
+
+        resp = await asyncio.to_thread(_s1a)
+        sap_redirect_url = resp.headers.get("Location", "")
+        _LOGGER.debug("[S1a] HTTP %s | Redirect: %s...", resp.status_code, sap_redirect_url[:80])
 
         if not sap_redirect_url:
             raise MinolAuthError("SAP sendete keinen Redirect zu Azure B2C!")
 
-        # === SCHRITT 1b: Azure B2C aufrufen mit encoded=True ===
-        _LOGGER.debug("[S1b] GET Azure B2C URL (encoded=True, allow_redirects=True)")
-        azure_url = URL(sap_redirect_url, encoded=True)
-        async with self._session.get(
-            azure_url,
-            headers=BROWSER_HEADERS,
-            allow_redirects=True,
-        ) as resp:
-            html = await resp.text()
-            azure_final_url = str(resp.url)
-            _LOGGER.debug("[S1b] Final-URL: %s | HTTP %s", azure_final_url, resp.status)
-            _LOGGER.debug("[S1b] Set-Cookie: %s", resp.headers.getall("Set-Cookie", []))
-        self._dump_cookie_jar("NACH S1")
+        # === SCHRITT 1b: Azure B2C aufrufen ===
+        _LOGGER.debug("[S1b] GET Azure B2C URL (allow_redirects=True)")
+
+        def _s1b():
+            return self._session.get(sap_redirect_url, allow_redirects=True)
+
+        resp = await asyncio.to_thread(_s1b)
+        html = resp.text
+        azure_final_url = resp.url
+        _LOGGER.debug("[S1b] Final-URL: %s | HTTP %s", azure_final_url, resp.status_code)
+        self._dump_cookies("NACH S1")
 
         # Prüfung: Ist bereits eine VALIDE SAMLResponse da?
         saml_match = re.search(r'(?is)name=[\'"]SAMLResponse[\'"].*?value=[\'"]([^\'"]+)[\'"]', html)
@@ -268,7 +238,7 @@ class MinolOnlineClient:
 
         else:
             if saml_match:
-                _LOGGER.debug("[S1b] SAMLResponse gefunden, aber ist FEHLER-Response. Führe normalen Login durch.")
+                _LOGGER.debug("[S1b] SAMLResponse gefunden, aber FEHLER-Response. Führe normalen Login durch.")
 
             # === SCHRITT 2: CSRF + TX aus Azure B2C Seite extrahieren ===
             csrf_match = re.search(r'"csrf"\s*:\s*"([^"]+)"', html)
@@ -283,65 +253,68 @@ class MinolOnlineClient:
             _LOGGER.debug("[S2] CSRF: %s... | TX: %s...", csrf_token[:15], tx_token[:15])
 
             # === SCHRITT 2: Credentials an Azure B2C senden ===
-            # Payload manuell in rohe Bytes wandeln, um automatische (und potentiell störende) aiohttp-Modifikationen zu umgehen
-            auth_payload = {
-                "request_type": "RESPONSE",
-                "signInName": self._username,
-                "password": self._password
-            }
-            auth_body_bytes = urllib.parse.urlencode(auth_payload).encode("utf-8")
-            
-            _LOGGER.debug(
-                "[S2] POST SelfAsserted | signInName: %s | password: ***",
-                urllib.parse.quote(self._username, safe=''),
+            auth_body = (
+                f"request_type=RESPONSE"
+                f"&signInName={urllib.parse.quote(self._username, safe='')}"
+                f"&password={urllib.parse.quote(self._password, safe='')}"
             )
 
-            # Striktes Nachbauen der PowerShell-Header
+            _LOGGER.debug("[S2] POST SelfAsserted | signInName: %s | password: ***", self._username)
+
             auth_headers = {
-                "User-Agent": PS_USER_AGENT,
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Accept-Language": BROWSER_HEADERS["Accept-Language"],
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": B2C_HOST,
+                "Referer": azure_final_url,
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
                 "X-CSRF-TOKEN": csrf_token,
-                "X-Requested-With": "XMLHttpRequest"
+                "X-Requested-With": "XMLHttpRequest",
             }
 
-            # URL manuell bauen und yarl-Encoding umgehen (encoded=True) - genau wie in PS
-            auth_url_str = f"{SELF_ASSERTED_URL}?tx={tx_token}&p={B2C_POLICY}"
+            auth_url = f"{SELF_ASSERTED_URL}?tx={tx_token}&p={B2C_POLICY}"
+            _LOGGER.debug("[S2] URL: %s", auth_url)
+            _LOGGER.debug("[S2] Body: %s", auth_body)
 
-            async with self._session.post(
-                URL(auth_url_str, encoded=True),
-                data=auth_body_bytes,
-                headers=auth_headers,
-                allow_redirects=False,
-            ) as resp2:
-                body = await resp2.text()
-                _LOGGER.debug("[S2] HTTP %s | Response Body: %s", resp2.status, body[:300])
+            def _s2():
+                return self._session.post(
+                    auth_url, data=auth_body, headers=auth_headers, allow_redirects=False,
+                )
 
-                if resp2.status == 400:
-                    _LOGGER.error("[S2] HTTP 400 von Azure B2C! Vollständiger Body:\n%s", body)
-                    raise MinolAuthError(
-                        f"Azure B2C lehnt Authentifizierungsanfrage ab (HTTP 400). "
-                        f"Mögliche Ursache: CSRF-Problem oder fehlende Header. Body: {body[:200]}"
-                    )
+            resp = await asyncio.to_thread(_s2)
+            body = resp.text
+            _LOGGER.debug("[S2] HTTP %s | Response: %s", resp.status_code, body[:300])
 
-                if '"status":"400"' in body or '"status": "400"' in body:
-                    _LOGGER.error("[S2] Zugangsdaten abgelehnt! Azure Antwort: %s", body)
-                    raise MinolAuthError("Login abgelehnt (E-Mail oder Passwort falsch).")
+            if resp.status_code == 400:
+                _LOGGER.error("[S2] HTTP 400 von Azure B2C! Body:\n%s", body)
+                raise MinolAuthError(
+                    f"Azure B2C lehnt Authentifizierungsanfrage ab (HTTP 400). "
+                    f"Mögliche Ursache: CSRF-Problem oder fehlende Header. Body: {body[:200]}"
+                )
 
-                _LOGGER.debug("[S2] Login von Azure akzeptiert.")
-            self._dump_cookie_jar("NACH S2")
+            if '"status":"400"' in body or '"status": "400"' in body:
+                _LOGGER.error("[S2] Zugangsdaten abgelehnt! Azure Antwort: %s", body)
+                raise MinolAuthError("Login abgelehnt (E-Mail oder Passwort falsch).")
+
+            _LOGGER.debug("[S2] Login von Azure akzeptiert.")
+            self._dump_cookies("NACH S2")
 
             # === SCHRITT 3: SAMLResponse vom Confirmed-Endpoint ===
-            # WICHTIG: Auch hier csrf_token und tx_token zwingend vor nochmaligem Encoding schützen!
-            conf_url_str = f"{CONFIRMED_URL}?rememberMe=false&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
-            _LOGGER.debug("[S3] GET Confirmed: %s", conf_url_str)
-            async with self._session.get(
-                URL(conf_url_str, encoded=True),
-                headers=BROWSER_HEADERS,
-                allow_redirects=True,
-            ) as resp:
-                conf_html = await resp.text()
-                _LOGGER.debug("[S3] HTTP %s | Final-URL: %s", resp.status, resp.url)
-            self._dump_cookie_jar("NACH S3")
+            conf_url = f"{CONFIRMED_URL}?rememberMe=false&csrf_token={csrf_token}&tx={tx_token}&p={B2C_POLICY}"
+            _LOGGER.debug("[S3] GET Confirmed: %s", conf_url)
+
+            def _s3():
+                return self._session.get(conf_url, headers=BROWSER_HEADERS, allow_redirects=True)
+
+            resp = await asyncio.to_thread(_s3)
+            conf_html = resp.text
+            _LOGGER.debug("[S3] HTTP %s | Final-URL: %s", resp.status_code, resp.url)
+            self._dump_cookies("NACH S3")
 
             saml_match = re.search(
                 r'(?is)name=[\'"]SAMLResponse[\'"].*?value=[\'"]([^\'"]+)[\'"]',
@@ -357,22 +330,22 @@ class MinolOnlineClient:
                 conf_html,
             )
             relay_state = relay_match.group(1) if relay_match else relay_state
-            _LOGGER.debug(
-                "[S3] SAMLResponse: %d Zeichen | RelayState: %s",
-                len(saml_response), relay_state,
-            )
+            _LOGGER.debug("[S3] SAMLResponse: %d Zeichen | RelayState: %s", len(saml_response), relay_state)
 
             if not self._is_saml_success(saml_response):
                 raise MinolAuthError("SAMLResponse nach Login enthält Fehler-Status!")
 
         # === SCHRITT 4: SAMLResponse an SAP ACS senden (manuelle Redirects) ===
         _LOGGER.debug("[S4] Sende SAMLResponse an SAP ACS (manuelle Redirect-Kette)...")
-        acs_body = await self._follow_redirects_from_post(
-            ACS_URL,
-            "S4-ACS",
-            post_data={"SAMLResponse": saml_response, "RelayState": relay_state},
-        )
-        self._dump_cookie_jar("NACH S4")
+
+        def _s4():
+            return self._follow_redirects_from_post(
+                ACS_URL, "S4-ACS",
+                post_data={"SAMLResponse": saml_response, "RelayState": relay_state},
+            )
+
+        acs_body = await asyncio.to_thread(_s4)
+        self._dump_cookies("NACH S4")
 
         # Prüfen ob SAP ein weiteres Formular erwartet
         form_action_match = re.search(r'(?is)<form[^>]+action=[\'"]([^\'"]+)[\'"]', acs_body)
@@ -394,28 +367,29 @@ class MinolOnlineClient:
             next_relay = next_relay_m.group(1) if next_relay_m else relay_state
             _LOGGER.debug("[S5] SAP erwartet weiteres Formular an: %s", next_action)
 
-            # === SCHRITT 5: App-Login (manuelle Redirects) ===
-            app_body = await self._follow_redirects_from_post(
-                next_action,
-                "S5-APP",
-                post_data={
-                    "SAMLResponse": next_saml,
-                    "RelayState": next_relay,
-                    "saml2post": "false",
-                },
-            )
-            self._dump_cookie_jar("NACH S5")
+            def _s5():
+                return self._follow_redirects_from_post(
+                    next_action, "S5-APP",
+                    post_data={
+                        "SAMLResponse": next_saml,
+                        "RelayState": next_relay,
+                        "saml2post": "false",
+                    },
+                )
+
+            await asyncio.to_thread(_s5)
+            self._dump_cookies("NACH S5")
         else:
             _LOGGER.debug("[S4] Kein weiteres SAP-Formular im ACS-Body erkannt.")
 
         _LOGGER.debug("=" * 60)
         _LOGGER.debug("=== AUTH ABGESCHLOSSEN ===")
-        self._dump_cookie_jar("FINAL")
+        self._dump_cookies("FINAL")
 
-        all_cookie_names = {c.key for c in self._session.cookie_jar}
-        if "MYSAPSSO2" in all_cookie_names:
+        if "MYSAPSSO2" in {c.name for c in self._session.cookies}:
             _LOGGER.debug("[AUTH] MYSAPSSO2 Cookie erfolgreich gesetzt!")
         else:
             _LOGGER.warning("[AUTH] MYSAPSSO2 Cookie fehlt nach Login!")
 
         self._is_authenticated = True
+
