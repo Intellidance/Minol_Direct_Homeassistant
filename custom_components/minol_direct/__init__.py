@@ -1,5 +1,4 @@
 import logging
-import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -11,13 +10,10 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
-    
-    jar = aiohttp.CookieJar(unsafe=True)
-    session = aiohttp.ClientSession(cookie_jar=jar)
-    
-    client = MinolOnlineClient(entry.data[CONF_USERNAME], entry.data[CONF_PASSWORD], session)
-    coordinator = MinolDataCoordinator(hass, client, session)
-    
+
+    client = MinolOnlineClient(entry.data[CONF_USERNAME], entry.data[CONF_PASSWORD])
+    coordinator = MinolDataCoordinator(hass, client)
+
     await coordinator.async_config_entry_first_refresh()
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
@@ -28,14 +24,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
-        if coordinator and coordinator.session:
-            await coordinator.session.close()
+        if coordinator and coordinator.client._session:
+            coordinator.client._session.close()
     return unload_ok
 
 class MinolDataCoordinator(DataUpdateCoordinator):
-    def __init__(self, hass: HomeAssistant, client: MinolOnlineClient, session: aiohttp.ClientSession) -> None:
+    def __init__(self, hass: HomeAssistant, client: MinolOnlineClient) -> None:
         self.client = client
-        self.session = session
         super().__init__(hass, logger=_LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL)
 
     async def _async_update_data(self):
